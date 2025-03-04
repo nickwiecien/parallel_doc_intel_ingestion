@@ -25,6 +25,7 @@ import subprocess
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 from doc_intelligence_utilities import analyze_pdf, extract_results
+from aoai_utilities import classify_image, analyze_image
 
 # An HTTP-Triggered Function with a Durable Functions Client binding
 @app.route(route="orchestrators/{functionName}")
@@ -55,6 +56,7 @@ def document_extraction_orchestrator(context):
     pages_container = f'{source_container}-pages'
     doc_intel_results_container = f'{source_container}-doc-intel-results'
     doc_intel_formatted_results_container = f'{source_container}-doc-intel-formatted-results'
+    image_analysis_results_container = f'{source_container}-image-analysis-results'
 
 
     # Confirm that all storage locations exist to support document ingestion
@@ -97,7 +99,7 @@ def document_extraction_orchestrator(context):
         pdf_pages = [json.loads(x) for x in split_pdf_files]
 
     except Exception as e:
-        context.set_custom_status('Ingestion Failed During PDF Splitting')
+        context.set_custom_status('Processing Failed During PDF Splitting')
         logging.error(e)
         raise e
 
@@ -115,11 +117,24 @@ def document_extraction_orchestrator(context):
         extracted_pdf_files = yield context.task_all(extract_pdf_tasks)
 
     except Exception as e:
-        context.set_custom_status('Ingestion Failed During Document Intelligence Extraction')
+        context.set_custom_status('Processing Failed During Document Intelligence Extraction')
         logging.error(e)
         raise e
 
     context.set_custom_status('Document Extraction Completion')
+
+    #Analyze all pages and determine if there is additional visual content that should be described
+    try:
+        image_analysis_tasks = []
+        for pdf in pdf_pages:
+            # Create a task to process the PDF page and append it to the extract_pdf_tasks list
+            image_analysis_tasks.append(context.call_activity("analyze_pages_for_embedded_visuals", json.dumps({'child': pdf['child'], 'parent': pdf['parent'], 'pages_container': pages_container, 'image_analysis_results_container': image_analysis_results_container})))
+        # Execute all the extract PDF tasks and get the results
+        analyzed_pdf_files = yield context.task_all(image_analysis_tasks)
+        analyzed_pdf_files = [x for x in analyzed_pdf_files if x is not None]
+    except Exception as e:
+        context.set_custom_status('Processing Failed During Image Analysis')
+
 
 @app.activity_trigger(input_name="activitypayload")
 def check_containers(activitypayload: str):
@@ -400,3 +415,118 @@ def get_source_files(activitypayload: str):
 
     # Return the list of file names
     return files
+
+@app.activity_trigger(input_name="activitypayload")
+def analyze_pages_for_embedded_visuals(activitypayload: str):
+    """
+    Analyze a single page in a PDF to determine if there are charts, graphs, etc.
+
+    Args:
+        activitypayload (str): The payload containing information about the PDF file.
+
+    Returns:
+        str: The updated filename of the processed PDF file.
+    """
+
+    # Load the activity payload as a JSON string
+    data = json.loads(activitypayload)
+
+    # Extract the child file name, parent file name, and container names from the payload
+    child = data.get("child")
+    parent = data.get("parent")
+    pages_container = data.get("pages_container")
+    image_analysis_results_container = data.get("image_analysis_results_container")
+
+    # Create a BlobServiceClient object which will be used to create a container client
+    blob_service_client = BlobServiceClient.from_connection_string(os.environ['STORAGE_CONN_STR'])
+
+    # Download pdf
+    pages_container_client = blob_service_client.get_container_client(container=pages_container)
+    image_analysis_results_container_client = blob_service_client.get_container_client(container=image_analysis_results_container)
+    pdf_blob_client = pages_container_client.get_blob_client(blob=child)
+
+    # Download the blob (PDF)
+    downloaded_blob = pdf_blob_client.download_blob()
+    pdf_bytes = downloaded_blob.readall()
+
+    png_bytes_io = pdf_bytes_to_png_bytes(pdf_bytes, 1)
+
+    # Convert to base64 for transmission or storage
+    png_bytes = png_bytes_io.getvalue()
+    png_bytes = base64.b64encode(png_bytes).decode('ascii')
+
+    # Set result filename
+    file_name = child.replace('.pdf', '.json')
+
+    # Chucksum calculation - download the PDF file as a stream
+    pdf_stream_downloader = (pdf_blob_client.download_blob())
+
+    # Calculate the MD5 hash of the PDF file
+    md5_hash = hashlib.md5()
+    for byte_block in iter(lambda: pdf_stream_downloader.read(4096), b""):
+        md5_hash.update(byte_block)
+    checksum = md5_hash.hexdigest()
+
+    # Do a baseline check here to see if the file already exists in the image analysis results container
+    # If yes then return the file name without processing
+    image_analysis_results_blob_client = image_analysis_results_container_client.get_blob_client(blob=file_name)
+    if image_analysis_results_blob_client.exists():
+        extract_data = json.loads((image_analysis_results_blob_client.download_blob().readall()))
+        # If the checksum in the extracts file matches the checksum of the PDF file
+        if 'checksum' in extract_data.keys():
+            if extract_data['checksum']==checksum:
+                return file_name
+
+    
+    ## TO-DO: ADD LOGIC FOR CHECKSUM CALCULATION HERE TO PREVENT DUPLICATE PROCESSING
+    # Save records to the image analysis results container in JSON format
+    visual_analysis_result = {'checksum':checksum, 'visual_description':''}
+
+    contains_visuals = classify_image(png_bytes)
+
+    if contains_visuals:
+        visual_description = analyze_image(png_bytes)
+        try:
+            visual_description = json.loads(visual_description)
+        except Exception as e:
+            pass
+        file_name = child.replace('.pdf', '.json')
+        visual_analysis_result['visual_description'] = str(visual_description)
+        image_analysis_results_blob_client = image_analysis_results_container_client.get_blob_client(blob=file_name)
+        image_analysis_results_blob_client.upload_blob(json.dumps(visual_analysis_result), overwrite=True)
+
+    else:
+        image_analysis_results_blob_client = image_analysis_results_container_client.get_blob_client(blob=file_name)
+        image_analysis_results_blob_client.upload_blob(json.dumps(visual_analysis_result), overwrite=True)
+    
+    return file_name
+
+def pdf_bytes_to_png_bytes(pdf_bytes, page_number=1):
+    # Load the PDF from a bytes object
+    pdf_stream = io.BytesIO(pdf_bytes)
+    document = pymupdf.open("pdf", pdf_stream)
+
+    # Select the page
+    page = document.load_page(page_number - 1)  # Adjust for zero-based index
+
+    # Render page to an image
+    pix = page.get_pixmap(dpi=200)
+
+    # Convert the PyMuPDF pixmap into a Pillow Image
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+    # Create a BytesIO object for the output PNG
+    png_bytes_io = io.BytesIO()
+
+    # Save the image to the BytesIO object using Pillow
+    img.save(png_bytes_io, "PNG")
+
+
+    # Rewind the BytesIO object to the beginning
+    png_bytes_io.seek(0)
+
+    # Close the document
+    document.close()
+
+    # Return the BytesIO object containing the PNG image
+    return png_bytes_io
